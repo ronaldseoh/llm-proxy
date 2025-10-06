@@ -214,8 +214,13 @@ class ProxyServer:
                     self.process_manager.is_healthy = True
                     logger.info("vLLM server is ready")
                     return
+                else:
+                    self.worker_ready = False
+                    self.process_manager.is_healthy = False
             except Exception as e:
                 logger.debug(f"vLLM server is not ready yet: {e}")
+                self.worker_ready = False
+                self.process_manager.is_healthy = False
                 pass
 
             if time.time() - last_logged_at > 60:
@@ -238,6 +243,19 @@ class ProxyServer:
                     logger.info(
                         f"Shutting down vLLM server after {idle_time:.0f}s of inactivity")
                     await self.process_manager.stop_vllm_server()
+
+            # update worker_healthy status
+            try:
+                ping_url = f"http://localhost:{self.target_port}{self.ping_path}"
+                response = await self.client.get(ping_url, timeout=5.0)
+                if response.status_code == 200:
+                    self.process_manager.is_healthy = True
+                else:
+                    self.process_manager.is_healthy = False
+            except Exception as e:
+                logger.debug(f"vLLM server is not ready yet: {e}")
+                self.process_manager.is_healthy = False
+                pass
 
     def set_vllm_command(self, command: list):
         """Set the vLLM command to use when starting the server."""
