@@ -37,6 +37,13 @@ class ProxyServer:
         self.client = httpx.AsyncClient(timeout=3000000.0)  # 5 minute timeout
         self.worker_ready = False
 
+        # Recovery / restart state
+        self._restart_lock = asyncio.Lock()
+        self.restart_count = 0
+        self.max_restarts = 5
+        self.base_backoff = 5.0    # seconds
+        self.max_backoff = 60.0    # seconds
+
         self._setup_routes()
         self._start_idle_monitor()
 
@@ -160,6 +167,9 @@ class ProxyServer:
                     content=body
                 )
 
+            # Successful response: reset the restart budget.
+            self.restart_count = 0
+
             # Handle regular responses
             return JSONResponse(
                 content=response.json() if response.headers.get(
@@ -169,17 +179,95 @@ class ProxyServer:
                          if k.lower() != "content-length"}
             )
 
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Connectivity failure: reverse tunnel died, or vLLM crashed.
+            logger.warning(
+                "Connectivity failure to vLLM: %s: %r",
+                type(e).__name__, e,
+            )
+            restarted = await self._recover_if_dead()
+            if restarted:
+                raise HTTPException(
+                    status_code=503,
+                    detail="vLLM server was down; a restart has been triggered. Retry shortly.",
+                )
             raise HTTPException(
                 status_code=503,
-                detail="Cannot connect to vLLM server"
+                detail="Cannot connect to vLLM server",
+            )
+        except httpx.ReadTimeout:
+            # vLLM is alive but slow. Never restart on this.
+            raise HTTPException(
+                status_code=504,
+                detail="vLLM request timed out",
+            )
+        except httpx.HTTPStatusError as e:
+            # vLLM itself returned an error status. Pass through untouched.
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
             )
         except Exception as e:
-            logger.error(f"Proxy request failed: {e}")
+            logger.error(
+                "Proxy request failed: %s: %r",
+                type(e).__name__, e, exc_info=True,
+            )
             raise HTTPException(
                 status_code=500,
-                detail=f"Proxy request failed: {str(e)}"
+                detail=f"Proxy request failed: {type(e).__name__}: {str(e)}",
             )
+
+    async def _recover_if_dead(self) -> bool:
+        """If the vLLM process is dead, trigger a background restart.
+
+        Returns True if a restart was triggered (or is already in progress).
+        """
+        # If the process is alive, do NOT restart — the failure was a
+        # transient tunnel glitch or a bad request.
+        if self.process_manager.is_process_running():
+            logger.warning(
+                "Request failed but vLLM process is alive; not restarting"
+            )
+            return False
+
+        async with self._restart_lock:
+            # Another concurrent request may have already triggered a restart.
+            if self.process_manager.is_process_starting_or_running():
+                return True
+
+            if self.restart_count >= self.max_restarts:
+                logger.error(
+                    "Restart budget exhausted (%d/%d); giving up",
+                    self.restart_count, self.max_restarts,
+                )
+                return False
+
+            self.restart_count += 1
+            logger.warning(
+                "vLLM process is dead; triggering restart (%d/%d)",
+                self.restart_count, self.max_restarts,
+            )
+            asyncio.create_task(self._restart_after_backoff())
+            return True
+
+    async def _restart_after_backoff(self):
+        """Wait with exponential backoff, then restart vLLM if still down."""
+        delay = min(
+            self.base_backoff * (2 ** (self.restart_count - 1)),
+            self.max_backoff,
+        )
+        logger.info("Restart backoff: waiting %.1fs before restart", delay)
+        await asyncio.sleep(delay)
+
+        async with self._restart_lock:
+            if self.process_manager.is_process_starting_or_running():
+                logger.info("vLLM already restarted by another request; skipping")
+                return
+            if not self.vllm_command:
+                logger.error("Cannot restart: vLLM command not set")
+                return
+            success = await self.process_manager.start_vllm_server(self.vllm_command)
+            logger.info("vLLM restart %s", "succeeded" if success else "failed")
 
     async def _stream_from_vllm(self, method, url, params, headers, content):
         """Stream response from vLLM server with proper context management."""

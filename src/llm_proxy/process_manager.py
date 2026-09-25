@@ -48,7 +48,10 @@ class ProcessManager:
         Returns:
             True if started successfully, False otherwise
         """
-        if self.is_running:
+        # is_process_running() reconciles the is_running flag with the real
+        # process state. This matters after a crash: is_running may still be
+        # True from the previous successful start.
+        if self.is_process_running():
             logger.warning("vLLM server is already running")
             return True
 
