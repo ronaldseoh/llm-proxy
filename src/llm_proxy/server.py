@@ -34,7 +34,7 @@ class ProxyServer:
         self.last_request_time = time.time()
         self.vllm_command: Optional[list] = None
         self.app = FastAPI(title="llm-proxy", version="0.1.0")
-        self.client = httpx.AsyncClient(timeout=300.0)  # 5 minute timeout
+        self.client = httpx.AsyncClient(timeout=3000000.0)  # 5 minute timeout
         self.worker_ready = False
 
         self._setup_routes()
