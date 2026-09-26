@@ -24,6 +24,9 @@ class ProxyServer:
         api_key: Optional[str] = None,
         idle_timeout: int = 1800,  # 30 minutes in seconds
         ping_path: str = "/ping",
+        keep_alive: bool = False,
+        watchdog_interval: int = 30,
+        max_consecutive_failures: int = 10,
     ):
         self.port = port
         self.target_port = target_port
@@ -37,15 +40,22 @@ class ProxyServer:
         self.client = httpx.AsyncClient(timeout=3000000.0)  # 5 minute timeout
         self.worker_ready = False
 
-        # Recovery / restart state
+        # Keep-alive watchdog state
+        self.keep_alive = keep_alive
+        self.watchdog_interval = watchdog_interval
+        self.max_consecutive_failures = max_consecutive_failures
+        self.base_backoff = 5.0
+        self.max_backoff = 60.0
+        self.consecutive_failures = 0
         self._restart_lock = asyncio.Lock()
-        self.restart_count = 0
-        self.max_restarts = 5
-        self.base_backoff = 5.0    # seconds
-        self.max_backoff = 60.0    # seconds
+        self._shutting_down = False
 
         self._setup_routes()
-        self._start_idle_monitor()
+        if self.keep_alive:
+            logger.info("Keep-alive mode: watchdog enabled, idle monitor disabled")
+            self._start_watchdog()
+        else:
+            self._start_idle_monitor()
 
     def verified_api_token(self, authorization: Optional[str] = Header(None)):
         """Verify API token if API key is configured."""
@@ -180,29 +190,29 @@ class ProxyServer:
             )
 
         except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
-            # Connectivity failure: reverse tunnel died, or vLLM crashed.
             logger.warning(
                 "Connectivity failure to vLLM: %s: %r",
                 type(e).__name__, e,
             )
-            restarted = await self._recover_if_dead()
-            if restarted:
-                raise HTTPException(
-                    status_code=503,
-                    detail="vLLM server was down; a restart has been triggered. Retry shortly.",
-                )
+            # If keep-alive is on, the watchdog will pick this up within
+            # watchdog_interval seconds. If it's off, the next request will
+            # trigger a fresh start.
             raise HTTPException(
                 status_code=503,
-                detail="Cannot connect to vLLM server",
+                detail=(
+                    "vLLM server is down; restart is in progress. Retry shortly."
+                    if self.keep_alive
+                    else "Cannot connect to vLLM server"
+                ),
             )
         except httpx.ReadTimeout:
-            # vLLM is alive but slow. Never restart on this.
+            # vLLM is alive but slow. Never trigger a restart on this.
             raise HTTPException(
                 status_code=504,
                 detail="vLLM request timed out",
             )
         except httpx.HTTPStatusError as e:
-            # vLLM itself returned an error status. Pass through untouched.
+            # vLLM itself returned an error status. Pass it through.
             raise HTTPException(
                 status_code=e.response.status_code,
                 detail=e.response.text,
@@ -345,12 +355,98 @@ class ProxyServer:
                 self.process_manager.is_healthy = False
                 pass
 
+    def _start_watchdog(self):
+        """Start the keep-alive watchdog task."""
+        asyncio.create_task(self._watchdog())
+
+    async def _watchdog(self):
+        """Ensure vLLM is always running while the proxy is up.
+
+        Polls the process state every `watchdog_interval` seconds. If the
+        process is dead, triggers a restart with exponential backoff.
+        """
+        # Small initial delay so the FastAPI app is fully up.
+        await asyncio.sleep(2)
+
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self.watchdog_interval)
+
+                if self._shutting_down:
+                    return
+
+                if self.process_manager.is_process_starting_or_running():
+                    # Healthy: reset the failure streak.
+                    if self.consecutive_failures > 0:
+                        logger.info(
+                            "Watchdog: vLLM is back up; resetting failure counter"
+                        )
+                    self.consecutive_failures = 0
+                    continue
+
+                # Process is dead. Restart it.
+                await self._watchdog_restart()
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(
+                    "Watchdog iteration failed: %s: %r",
+                    type(e).__name__, e, exc_info=True,
+                )
+
+    async def _watchdog_restart(self):
+        """Restart vLLM under the restart lock, with backoff and a failure cap."""
+        async with self._restart_lock:
+            # Re-check: another caller may have already restarted it.
+            if self.process_manager.is_process_starting_or_running():
+                return
+
+            if not self.vllm_command:
+                logger.error("Watchdog: cannot restart, vLLM command not set")
+                return
+
+            self.consecutive_failures += 1
+            if self.consecutive_failures > self.max_consecutive_failures:
+                logger.error(
+                    "Watchdog: %d consecutive failures reached; "
+                    "stopping restarts until proxy is restarted",
+                    self.consecutive_failures,
+                )
+                self._shutting_down = True
+                return
+
+            delay = min(
+                self.base_backoff * (2 ** (self.consecutive_failures - 1)),
+                self.max_backoff,
+            )
+            logger.warning(
+                "Watchdog: vLLM is not running; restarting in %.1fs "
+                "(attempt %d/%d)",
+                delay, self.consecutive_failures, self.max_consecutive_failures,
+            )
+            await asyncio.sleep(delay)
+
+            if self._shutting_down:
+                return
+
+            success = await self.process_manager.start_vllm_server(
+                self.vllm_command
+            )
+            if success:
+                logger.info("Watchdog: vLLM restart command succeeded")
+                # Do not reset consecutive_failures here — reset only after
+                # the process survives to the next watchdog tick.
+            else:
+                logger.error("Watchdog: vLLM restart command failed immediately")
+
     def set_vllm_command(self, command: list):
         """Set the vLLM command to use when starting the server."""
         self.vllm_command = command
 
     async def cleanup(self):
         """Clean up resources."""
+        self._shutting_down = True
         self.worker_ready = False
         await self.client.aclose()
         await self.process_manager.cleanup()

@@ -85,6 +85,24 @@ def signal_handler(signum, frame):
     "--api-key",
     help="API key for Bearer token authentication (optional)"
 )
+@click.option(
+    "--keep-alive",
+    is_flag=True,
+    help="Keep vLLM running continuously. Disables idle timeout and "
+         "restarts vLLM automatically when the SLURM job dies."
+)
+@click.option(
+    "--watchdog-interval",
+    default=30,
+    type=int,
+    help="Seconds between watchdog checks in keep-alive mode (default: 30)"
+)
+@click.option(
+    "--max-consecutive-failures",
+    default=10,
+    type=int,
+    help="Give up restarting after this many consecutive failures (default: 10)"
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -98,6 +116,9 @@ def main(
     ping_path: str,
     log_level: str,
     api_key: Optional[str],
+    keep_alive: bool,
+    watchdog_interval: int,
+    max_consecutive_failures: int,
 ):
     """
     llm-proxy: A FastAPI proxy server for vLLM with SLURM support.
@@ -170,7 +191,10 @@ def main(
         ping_path=ping_path,
         vllm_command=vllm_command_list,
         instance_id=instance_id,
-        api_key=api_key
+        api_key=api_key,
+        keep_alive=keep_alive,
+        watchdog_interval=watchdog_interval,
+        max_consecutive_failures=max_consecutive_failures,
     ))
 
 
@@ -185,7 +209,10 @@ async def async_main(
     ping_path: str,
     vllm_command: List[str],
     instance_id: str,
-    api_key: Optional[str]
+    api_key: Optional[str],
+    keep_alive: bool,
+    watchdog_interval: int,
+    max_consecutive_failures: int,
 ):
     """Async main function."""
     # Set up signal handlers
@@ -209,7 +236,10 @@ async def async_main(
         process_manager=process_manager,
         api_key=api_key,
         idle_timeout=idle_timeout,
-        ping_path=ping_path
+        ping_path=ping_path,
+        keep_alive=keep_alive,
+        watchdog_interval=watchdog_interval,
+        max_consecutive_failures=max_consecutive_failures,
     )
 
     # Set the vLLM command
